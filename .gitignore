@@ -1,0 +1,6 @@
+.pio
+include/solar_config.h
+previews/
+test/
+tools/
+scripts/__pacache__

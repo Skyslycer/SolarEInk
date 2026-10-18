@@ -1,0 +1,3 @@
+#!/bin/sh
+# Use the same Python/pyserial installation as PlatformIO.
+exec "${PLATFORMIO_CORE_DIR:-$HOME/.platformio}/penv/bin/python" "$(dirname "$0")/scripts/monitor.py" "$@"

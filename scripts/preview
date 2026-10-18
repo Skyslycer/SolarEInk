@@ -1,0 +1,46 @@
+#!/bin/sh
+set -eu
+cd "$(dirname "$0")/.."
+mkdir -p previews
+c++ -std=c++11 -DARDUINO=100 -Iscripts/host -Iinclude \
+  -DARDUINOJSON_ENABLE_ARDUINO_STRING=0 -DARDUINOJSON_ENABLE_ARDUINO_PRINT=0 \
+  -DARDUINOJSON_ENABLE_ARDUINO_STREAM=0 -DARDUINOJSON_ENABLE_PROGMEM=0 \
+  -I.pio/libdeps/esp32-s3-supermini/ArduinoJson/src \
+  '-I.pio/libdeps/esp32-s3-supermini/Adafruit GFX Library' \
+  src/dashboard.cpp src/icons.cpp scripts/render_preview.cpp \
+  '.pio/libdeps/esp32-s3-supermini/Adafruit GFX Library/Adafruit_GFX.cpp' \
+  -o /tmp/solareink-preview
+/tmp/solareink-preview
+python3 - <<'PY'
+from pathlib import Path
+from PIL import Image, ImageDraw
+for path in Path('previews').glob('*.ppm'):
+    with Image.open(path) as rendered:
+        image = rendered.copy()
+    image.save(path.with_suffix('.png'))
+    if not path.stem.startswith('weather_'):
+        for scale in (2,4):
+            image.resize((296*scale,128*scale), Image.Resampling.NEAREST).save(path.with_name(f'{path.stem}-{scale}x.png'))
+    path.unlink()  # Keep the PNGs; discard the much larger intermediate files.
+solar = Image.open('previews/normal.png').crop((106,2,146,43))
+solar.resize((240,246), Image.Resampling.NEAREST).save('previews/solar-icon-detail-6x.png')
+wifi = Image.open('previews/normal.png').crop((195,10,220,30))
+wifi.resize((200,160), Image.Resampling.NEAREST).save('previews/wifi-icon-detail-8x.png')
+paths = sorted(Path('previews').glob('weather_*.png'), key=lambda p:int(p.stem[8:]))
+sheet = Image.new('RGB',(4*320,7*164),'#dddddd')
+for i,path in enumerate(paths):
+    x,y=(i%4)*320,(i//4)*164
+    sheet.paste(Image.open(path),(x+12,y+25))
+    ImageDraw.Draw(sheet).text((x+12,y+5),path.stem,fill='black')
+sheet.save('previews/weather-sheet.png')
+flows = [('normal', 'Grid import / battery discharging'),
+         ('charging', 'Grid export / battery charging'),
+         ('import_charging', 'Grid import / battery charging'),
+         ('export_discharging', 'Grid export / battery discharging')]
+sheet = Image.new('RGB', (616, 4*296+12), '#eeeeee')
+for i,(name,label) in enumerate(flows):
+    y=12+i*296
+    ImageDraw.Draw(sheet).text((12,y), label, fill='black')
+    sheet.paste(Image.open(f'previews/{name}-2x.png'), (12,y+24))
+sheet.save('previews/flow-directions.png')
+PY
