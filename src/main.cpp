@@ -8,6 +8,7 @@
 #include "clock_sync.h"
 #include "display.h"
 #include "logic.h"
+#include "metrics.h"
 #include "network.h"
 
 RTC_DATA_ATTR uint32_t bootCount = 0;
@@ -18,6 +19,10 @@ RTC_DATA_ATTR uint32_t prepareEstimateMs = Timing::INITIAL_PREPARE_MS;
 RTC_DATA_ATTR bool checkupPending = false;
 
 namespace {
+uint32_t waitSleeps = 0;
+uint32_t waitSleptMs = 0;
+uint32_t waitSleepFails = 0;
+
 // Alignment waits (from "image ready" until the refresh must start) run with
 // the CPU awake otherwise. When no USB host is attached, light-sleep through
 // them in short slices; with a monitor attached keep the plain delay so the
@@ -29,10 +34,85 @@ void waitSlice(uint32_t ms) {
         return;
     }
     esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(ms) * 1000);
-    if (esp_light_sleep_start() != ESP_OK) delay(ms);
+    const int64_t start = esp_timer_get_time();
+    if (esp_light_sleep_start() != ESP_OK) {
+        ++waitSleepFails;
+        delay(ms);
+        return;
+    }
+    ++waitSleeps;
+    waitSleptMs += static_cast<uint32_t>((esp_timer_get_time() - start) / 1000);
+}
+
+void captureWifi(Metrics::Cycle& record, bool ok) {
+    const Network::WifiStats& stats = Network::lastWifiStats();
+    record.wifiOk = ok;
+    record.wifiMs = stats.ms;
+    record.wifiCached = stats.cachedUsed;
+    record.wifiFallback = stats.cachedFailed;
+    record.wifiAttempts = stats.attempts;
+    record.wifiStatus = stats.status;
+    record.wifiReason = stats.reason;
+    if (!ok) return;
+    record.rssi = WiFi.RSSI();
+    record.channel = WiFi.channel();
+    snprintf(record.bssid, sizeof(record.bssid), "%s", WiFi.BSSIDstr().c_str());
+    snprintf(record.ip, sizeof(record.ip), "%s", WiFi.localIP().toString().c_str());
+}
+
+void captureNtp(Metrics::Cycle& record) {
+    const Clock::SyncStats& stats = Clock::lastSyncStats();
+    record.ntpRan = stats.ran;
+    record.ntpOk = stats.ok;
+    record.ntpAttempts = stats.attempts;
+    record.ntpMs = stats.ms;
+    record.ntpDriftMs = stats.driftMs;
+}
+
+void captureFronius(Metrics::Cycle& record, const Readings::Fronius& reading, bool ok) {
+    const Network::FetchStats& stats = Network::froniusStats();
+    record.frOk = ok;
+    record.frAttempts = stats.attempts;
+    record.frMs = stats.ms;
+    record.frHttp = stats.http;
+    record.frBytes = stats.bytes;
+    record.pvW = reading.pv;
+    record.loadW = reading.load;
+    record.gridW = reading.grid;
+    record.battW = reading.battery;
+    record.soc = reading.soc;
+    record.backup = reading.backupKnown ? (reading.backup ? 1 : 0) : -1;
+}
+
+void captureWeather(Metrics::Cycle& record, const Readings::Weather& reading, bool ok) {
+    const Network::FetchStats& stats = Network::weatherStats();
+    record.wxOk = ok;
+    record.wxAttempts = stats.attempts;
+    record.wxMs = stats.ms;
+    record.wxHttp = stats.http;
+    record.wxBytes = stats.bytes;
+    record.tminC = reading.minimum;
+    record.tmaxC = reading.maximum;
+    record.precipPct = reading.precipitation;
+    record.code = reading.code;
 }
 
 void deepSleepFor(int64_t sleepUs) {
+    Metrics::Cycle& record = Metrics::current();
+    record.awakeMs = static_cast<uint32_t>(esp_timer_get_time() / 1000);
+    record.usb = static_cast<bool>(Serial);
+    record.clockOk = Clock::valid();
+    record.chipTempC = temperatureRead();
+    record.heapFree = ESP.getFreeHeap();
+    record.heapMin = ESP.getMinFreeHeap();
+    record.heapMax = ESP.getMaxAllocHeap();
+    record.waitSleeps = waitSleeps;
+    record.waitSleptMs = waitSleptMs;
+    record.refSleeps = Screen::epaperStats().sleeps;
+    record.refSleptMs = Screen::epaperStats().sleptMs;
+    record.sleepFails = waitSleepFails + Screen::epaperStats().fails;
+    Metrics::stage();
+
     Serial.printf("Wi-Fi off. Total awake so far: %.3f ms; deep sleep: %.3f s\n",
                   esp_timer_get_time() / 1000.0, sleepUs / 1000000.0);
     const int64_t flushStart = esp_timer_get_time();
@@ -59,6 +139,9 @@ int64_t nextAllowedTargetMs(int64_t targetMs) {
 
 void setup() {
     const auto wakeCause = esp_sleep_get_wakeup_cause();
+    // RTC state is only meaningful across a deep-sleep wake. On a cold boot or
+    // after reflashing (where the RTC layout may have changed), drop it.
+    if (wakeCause != ESP_SLEEP_WAKEUP_TIMER) Metrics::resetPending();
     ++bootCount;
     Serial.begin(115200);
     Serial.setTxTimeoutMs(Config::SERIAL_TX_TIMEOUT_MS);
@@ -66,6 +149,11 @@ void setup() {
     while (!Serial && millis() - serialStart < Config::SERIAL_WAIT_MS) delay(10);
     const bool checkup = checkupPending && wakeCause == ESP_SLEEP_WAKEUP_TIMER;
     checkupPending = false;
+    Metrics::Cycle& record = Metrics::current();
+    record.bootCount = bootCount;
+    record.wakeCause = static_cast<int>(wakeCause);
+    record.resetReason = static_cast<int>(esp_reset_reason());
+    record.checkup = checkup;
     Serial.printf("\nBoot #%lu, wake=%s (%d), reset=%d%s\n",
                   static_cast<unsigned long>(bootCount),
                   wakeCause == ESP_SLEEP_WAKEUP_TIMER ? "deep-sleep timer" : "power/reset/other",
@@ -75,9 +163,18 @@ void setup() {
         Serial.printf("Previous cycle awake through final Serial flush: %.3f ms\n", previousAwakeUs / 1000.0);
 
     Clock::configureTimezone();
+    record.syncAgeS = Clock::lastSyncAgeSeconds();
     if (checkup) {
+        record.plan = Metrics::PlanCheckup;
+        record.volts = readDeviceBatteryVolts();
+        record.percent = Logic::batteryPercent(record.volts);
         const bool wifi = Network::connectWifi();
-        if (wifi) Clock::syncIfNeeded(true);
+        captureWifi(record, wifi);
+        if (wifi) {
+            Clock::syncIfNeeded(true);
+            captureNtp(record);
+            Metrics::postPending();
+        }
         WiFi.disconnect(true, false);
         WiFi.mode(WIFI_OFF);
         int64_t sleepUs = 0;
@@ -99,13 +196,20 @@ void setup() {
     Dashboard data;
     data.deviceVolts = readDeviceBatteryVolts();
     data.devicePercent = Logic::batteryPercent(data.deviceVolts);
+    record.volts = data.deviceVolts;
+    record.percent = data.devicePercent;
     data.wifi = Network::connectWifi();
+    captureWifi(record, data.wifi);
     bool solarOk = false, weatherOk = false;
     if (data.wifi) {
         data.rssi = WiFi.RSSI();
         Clock::syncIfNeeded();
+        captureNtp(record);
         solarOk = Network::pollFronius(data.solar);
+        captureFronius(record, data.solar, solarOk);
         weatherOk = Network::pollWeather(data.weather);
+        captureWeather(record, data.weather, weatherOk);
+        Metrics::postPending();
     }
     Serial.printf("Cycle: Wi-Fi=%s Fronius=%s weather=%s\n", data.wifi ? "OK" : "FAILED",
                   data.wifi ? (solarOk ? "OK" : "FAILED/INCOMPLETE") : "SKIPPED",
@@ -127,6 +231,11 @@ void setup() {
         targetMs = plan.targetMs;
         Clock::format(targetMs, data.clock);
     }
+    record.plan = plan.refreshNow ? Metrics::PlanRefresh
+                : plan.missedMs ? Metrics::PlanTooLate
+                                : Metrics::PlanNoTarget;
+    record.targetEpoch = targetMs / 1000;
+    record.missedMs = plan.missedMs;
     uint32_t prepareMs;
     if (!plan.refreshNow) {
         prepareMs = esp_timer_get_time() / 1000;
@@ -139,8 +248,11 @@ void setup() {
             Serial.printf("No target yet; sleeping through to the %s update\n", data.clock);
         }
     } else {
+        const int64_t prepareStartUs = esp_timer_get_time();
         Screen::prepare(data);
-        prepareMs = esp_timer_get_time() / 1000;
+        const int64_t prepareEndUs = esp_timer_get_time();
+        prepareMs = static_cast<uint32_t>(prepareEndUs / 1000);
+        record.prepMs = static_cast<uint32_t>((prepareEndUs - prepareStartUs) / 1000);
         if (targetMs) {
             int64_t waitMs = targetMs - refreshEstimateMs - Clock::nowMs();
             Serial.printf("Display target %s; starting refresh in %lld ms (estimate %lu ms)\n",
@@ -154,10 +266,14 @@ void setup() {
             Serial.println("No synchronized clock: displaying --:-- and using relative wake timing");
         }
         const uint32_t actualRefreshMs = Screen::refreshAndSleep();
+        record.refreshMs = actualRefreshMs;
         if (actualRefreshMs >= 5000 && actualRefreshMs <= 55000) refreshEstimateMs = actualRefreshMs;
-        if (targetMs)
+        if (targetMs) {
+            const int64_t errorMs = Clock::nowMs() - targetMs;
+            record.completionErrMs = errorMs;
             Serial.printf("Refresh completion error: %+lld ms from target\n",
-                          static_cast<long long>(Clock::nowMs() - targetMs));
+                          static_cast<long long>(errorMs));
+        }
     }
     // Include application startup, ADC, Wi-Fi and requests, plus framebuffer
     // setup when the refresh runs. Exclude alignment waits and display waveform.

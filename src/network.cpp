@@ -10,6 +10,10 @@ namespace {
 std::atomic<unsigned> disconnectReason{0};
 std::atomic<bool> associated{false};
 
+WifiStats wifiStats;
+FetchStats froniusFetch;
+FetchStats weatherFetch;
+
 // Access point cached by the last successful connect. RTC memory survives
 // deep sleep; the channel range check rejects stale/garbage values after any
 // reset that clears RTC memory, and failures fall back to the scan path.
@@ -45,8 +49,10 @@ const char* reasonName(unsigned reason) {
 
 bool connectWifi() {
     const uint32_t start = millis();
+    wifiStats = WifiStats{};
     if (strcmp(Config::WIFI_SSID, "YOUR_WIFI_SSID") == 0) {
         Serial.println("Wi-Fi: configure include/solar_config.h first (skipped, 0 ms)");
+        wifiStats.ms = millis() - start;
         return false;
     }
     WiFi.persistent(false);
@@ -63,10 +69,14 @@ bool connectWifi() {
     if (!WiFi.mode(WIFI_STA)) {
         WiFi.removeEvent(eventId);
         Serial.println("Wi-Fi: station initialization failed");
+        wifiStats.ms = millis() - start;
+        wifiStats.status = WiFi.status();
         return false;
     }
     wl_status_t beginStatus = WL_IDLE_STATUS;
     if (cachedChannel >= 1 && cachedChannel <= 14) {
+        wifiStats.cachedUsed = true;
+        ++wifiStats.attempts;
         Serial.printf("Wi-Fi: cached AP %02X:%02X:%02X:%02X:%02X:%02X channel %d\n",
                       cachedBssid[0], cachedBssid[1], cachedBssid[2],
                       cachedBssid[3], cachedBssid[4], cachedBssid[5], cachedChannel);
@@ -75,6 +85,7 @@ bool connectWifi() {
         while (WiFi.status() != WL_CONNECTED && millis() - attemptStart < Timing::WIFI_CACHED_TIMEOUT_MS)
             delay(20);
         if (WiFi.status() != WL_CONNECTED) {
+            wifiStats.cachedFailed = true;
             Serial.printf("Wi-Fi: cached AP failed, status=%d, elapsed=%lu ms, reason=%u (%s)\n",
                           static_cast<int>(WiFi.status()),
                           static_cast<unsigned long>(millis() - attemptStart),
@@ -98,6 +109,7 @@ bool connectWifi() {
             disconnectReason.store(0);
             associated.store(false);
         }
+        ++wifiStats.attempts;
         const uint32_t attemptStart = millis();
         beginStatus = WiFi.begin(Config::WIFI_SSID, Config::WIFI_PASSWORD);
         while (WiFi.status() != WL_CONNECTED && millis() - attemptStart < Config::WIFI_TIMEOUT_MS)
@@ -112,6 +124,9 @@ bool connectWifi() {
     }
     WiFi.removeEvent(eventId);
     if (WiFi.status() != WL_CONNECTED) {
+        wifiStats.ms = millis() - start;
+        wifiStats.status = static_cast<int>(WiFi.status());
+        wifiStats.reason = static_cast<int>(disconnectReason.load());
         Serial.printf("Wi-Fi: FAILED, status=%d, duration=%lu ms\n",
                       static_cast<int>(WiFi.status()), static_cast<unsigned long>(millis() - start));
         const unsigned reason = disconnectReason.load();
@@ -126,6 +141,9 @@ bool connectWifi() {
         cachedChannel = channel;
         memcpy(cachedBssid, bssid, sizeof(cachedBssid));
     }
+    wifiStats.ms = millis() - start;
+    wifiStats.status = static_cast<int>(WiFi.status());
+    wifiStats.reason = static_cast<int>(disconnectReason.load());
     Serial.printf("Wi-Fi: connected, IP=%s, RSSI=%d dBm, duration=%lu ms\n",
                   WiFi.localIP().toString().c_str(), WiFi.RSSI(),
                   static_cast<unsigned long>(millis() - start));
@@ -134,7 +152,7 @@ bool connectWifi() {
 
 // HTTP/1.0 requests avoid chunked transfer framing; the full body is bounded by
 // both size and elapsed time, then parsed so truncated replies are rejected.
-bool fetchJsonOnce(const char* label, const String& url, JsonDocument& document) {
+bool fetchJsonOnce(const char* label, const String& url, JsonDocument& document, FetchStats& stats) {
     const uint32_t start = millis();
     WiFiClient client;
     HTTPClient http;
@@ -148,10 +166,12 @@ bool fetchJsonOnce(const char* label, const String& url, JsonDocument& document)
     size_t bytes = 0;
     do {
         if (!http.begin(client, url)) {
+            stats.http = -1;
             Serial.printf("%s: cannot initialize HTTP\n", label);
             break;
         }
         const int status = http.GET();
+        stats.http = status;
         Serial.printf("%s: HTTP %d, headers after %lu ms\n", label, status,
                       static_cast<unsigned long>(millis() - start));
         if (status != HTTP_CODE_OK) {
@@ -202,6 +222,7 @@ bool fetchJsonOnce(const char* label, const String& url, JsonDocument& document)
             }
         }
         bytes = body.length();
+        stats.bytes = static_cast<uint32_t>(bytes);
         if (!bodyOk) break;
         if (expected >= 0 && bytes != static_cast<size_t>(expected)) {
             Serial.printf("%s: truncated response\n", label);
@@ -221,13 +242,20 @@ bool fetchJsonOnce(const char* label, const String& url, JsonDocument& document)
     return success;
 }
 
-bool fetchJson(const char* label, const String& url, JsonDocument& document) {
+bool fetchJson(const char* label, const String& url, JsonDocument& document, FetchStats& stats) {
+    stats = FetchStats{};
+    const uint32_t start = millis();
     for (unsigned attempt = 1; attempt <= Timing::API_ATTEMPTS; ++attempt) {
+        ++stats.attempts;
         document.clear();
         Serial.printf("%s: attempt %u/%u\n", label, attempt, Timing::API_ATTEMPTS);
-        if (fetchJsonOnce(label, url, document)) return true;
+        if (fetchJsonOnce(label, url, document, stats)) {
+            stats.ms = millis() - start;
+            return true;
+        }
         if (attempt < Timing::API_ATTEMPTS) delay(Timing::API_RETRY_DELAY_MS);
     }
+    stats.ms = millis() - start;
     Serial.printf("%s: failed after %u attempts\n", label, Timing::API_ATTEMPTS);
     return false;
 }
@@ -241,7 +269,7 @@ bool pollFronius(Readings::Fronius& reading) {
     JsonDocument document;
     const String url = String("http://") + Config::FRONIUS_IP +
                        "/solar_api/v1/GetPowerFlowRealtimeData.fcgi";
-    if (!fetchJson("Fronius", url, document)) return false;
+    if (!fetchJson("Fronius", url, document, froniusFetch)) return false;
     reading = Readings::parseFronius(document.as<JsonVariantConst>());
     printValue("Solar production", reading.pv, "W");
     printValue("House consumption", reading.consumption(), "W");
@@ -266,7 +294,7 @@ bool pollWeather(Readings::Weather& reading) {
                        "precipitation_probability_max,weather_code"
                        "&temperature_unit=celsius&timezone=auto&forecast_days=1";
     JsonDocument document;
-    if (!fetchJson("Open-Meteo", url, document)) return false;
+    if (!fetchJson("Open-Meteo", url, document, weatherFetch)) return false;
     reading = Readings::parseWeather(document.as<JsonVariantConst>());
     Serial.printf("  Forecast date: %s, timezone: %s\n",
                   document["daily"]["time"][0].as<const char*>() ?: "unavailable",
@@ -278,4 +306,8 @@ bool pollWeather(Readings::Weather& reading) {
     if (!reading.complete()) Serial.println("Open-Meteo: missing/invalid fields or API error");
     return reading.complete();
 }
+
+const WifiStats& lastWifiStats() { return wifiStats; }
+const FetchStats& froniusStats() { return froniusFetch; }
+const FetchStats& weatherStats() { return weatherFetch; }
 }  // namespace Network

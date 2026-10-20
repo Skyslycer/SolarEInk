@@ -8,6 +8,7 @@
 namespace {
 RTC_DATA_ATTR time_t lastSync = 0;
 volatile bool synchronized = false;
+Clock::SyncStats syncStats;
 void receivedTime(struct timeval*) { synchronized = true; }
 }
 
@@ -26,8 +27,12 @@ void syncIfNeeded(bool force) {
     const time_t now = time(nullptr);
     if (!force && valid() && lastSync > 0 && now >= lastSync &&
         now - lastSync < Timing::NTP_RESYNC_SECONDS) return;
+    syncStats = SyncStats{};
+    syncStats.ran = true;
     sntp_set_time_sync_notification_cb(receivedTime);
     const uint32_t start = millis();
+    const int64_t wallStart = nowMs();
+    unsigned attempts = 0;
     bool success = false;
     for (unsigned attempt = 0; attempt <= Timing::NTP_RETRIES; ++attempt) {
         if (attempt > 0) {
@@ -38,11 +43,16 @@ void syncIfNeeded(bool force) {
         }
         synchronized = false;
         configTzTime(Timing::TIMEZONE, Timing::NTP_SERVER, "time.cloudflare.com");
+        ++attempts;
         const uint32_t attemptStart = millis();
         while (!synchronized && millis() - attemptStart < Timing::NTP_TIMEOUT_MS) delay(20);
         if (synchronized && valid()) {
             lastSync = time(nullptr);
             success = true;
+            // The clock jump applied by SNTP is the error accumulated since the
+            // previous sync (plus the few milliseconds of callback/poll latency).
+            syncStats.driftMs = (nowMs() - wallStart) -
+                                static_cast<int64_t>(millis() - start);
             Serial.printf("Time sync: OK on attempt %u/%u, %lu ms\n", attempt + 1,
                           Timing::NTP_RETRIES + 1,
                           static_cast<unsigned long>(millis() - attemptStart));
@@ -57,10 +67,19 @@ void syncIfNeeded(bool force) {
     // continues through deep sleep, so a successful sync needs no repeat until
     // the six-hour resync interval expires.
     sntp_stop();
+    syncStats.ok = success;
+    syncStats.attempts = attempts;
+    syncStats.ms = millis() - start;
     Serial.printf("Time sync: %s after %lu ms; clock %s\n",
                   success ? "OK" : "failed", static_cast<unsigned long>(millis() - start),
                   valid() ? "available" : "unavailable");
 }
+int64_t lastSyncAgeSeconds() {
+    const time_t now = time(nullptr);
+    if (lastSync <= 0 || now < lastSync) return -1;
+    return static_cast<int64_t>(now - lastSync);
+}
+const SyncStats& lastSyncStats() { return syncStats; }
 void format(int64_t epochMs, char (&text)[6]) {
     if (epochMs < 1704067200000LL) { snprintf(text, sizeof(text), "--:--"); return; }
     const time_t seconds = epochMs / 1000;

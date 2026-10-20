@@ -1,12 +1,15 @@
 #include <GxEPD2_3C.h>
 #include <SPI.h>
 #include <esp_sleep.h>
+#include <esp_timer.h>
 #include "app_config.h"
 #include "display.h"
 
 namespace {
 GxEPD2_3C<GxEPD2_290_C90c, GxEPD2_290_C90c::HEIGHT> display(
     GxEPD2_290_C90c(Hardware::EPD_CS, Hardware::EPD_DC, Hardware::EPD_RST, Hardware::EPD_BUSY));
+
+Screen::EpaperStats epaperStats;
 
 // GxEPD2 polls BUSY with delay(1) while the panel runs its ~27 s waveform,
 // holding the CPU at full clock. With no USB host attached, sleep through the
@@ -20,11 +23,20 @@ void panelBusySleep(const void*) {
         return;
     }
     esp_sleep_enable_timer_wakeup(Timing::PANEL_BUSY_SLEEP_SLICE_US);
-    if (esp_light_sleep_start() != ESP_OK) delay(1);
+    const int64_t start = esp_timer_get_time();
+    if (esp_light_sleep_start() != ESP_OK) {
+        ++epaperStats.fails;
+        delay(1);
+        return;
+    }
+    ++epaperStats.sleeps;
+    epaperStats.sleptMs += static_cast<uint32_t>((esp_timer_get_time() - start) / 1000);
 }
 }
 
 namespace Screen {
+const EpaperStats& epaperStats() { return ::epaperStats; }
+
 void prepare(const Dashboard& data) {
     SPI.begin(Hardware::EPD_SCK, -1, Hardware::EPD_MOSI, Hardware::EPD_CS);
     display.init(115200, true, 50, false, SPI, SPISettings(4000000, MSBFIRST, SPI_MODE0));

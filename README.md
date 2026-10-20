@@ -47,6 +47,9 @@ night until the 06:00 mark. The overnight sleep is split by a time-sync-only
 checkup at `CHECKUP_HOUR` (default **5**, local time); afterwards the board
 sleeps until `MORNING_WAKE_BEFORE_MINUTES` (default **1**) before the first
 update. Pin, ADC, timezone, and NTP settings are in `include/app_config.h`.
+The optional InfluxDB settings (`INFLUX_URL`, `INFLUX_ORG`, `INFLUX_BUCKET`,
+`INFLUX_TOKEN`, and the `DEVICE_NAME` tag) live in the same file; leave
+`INFLUX_URL` empty to disable telemetry.
 
 ```sh
 pio run
@@ -163,10 +166,50 @@ status/timing, parsed values, refresh time, target error, awake time and sleep
 duration. Check these when measuring externally; neither firmware timestamps
 nor the ADC measure supply current.
 
+## InfluxDB telemetry (optional)
+
+Fill in `INFLUX_URL` (server base URL, for example
+`http://192.168.1.50:8086`), `INFLUX_ORG`, `INFLUX_BUCKET`, and `INFLUX_TOKEN`
+in `include/solar_config.h` to log one point per cycle to the measurement
+`solar`. The tags are `name` (`DEVICE_NAME`), `mac`, and `fw`
+(`App::FIRMWARE_VERSION` in `include/app_config.h`; bump it for every flashed
+change). Leaving `INFLUX_URL` empty disables the feature.
+
+A cycle only knows its refresh duration and completion error after the panel
+has finished, which is after Wi-Fi is normally switched off. The record is
+therefore completed just before deep sleep, kept in RTC memory, and posted on
+the **next** cycle's Wi-Fi window, right after the API fetches. The point's
+timestamp is the recorded cycle's wake time from the device clock (server time
+only when the clock was never synchronized), so intervals and sleep durations
+can be derived from consecutive timestamps. The first cycle after flashing or
+a hardware reset has no predecessor and posts nothing.
+
+The write is one HTTP/1.0 `POST /api/v2/write` (line protocol, second
+precision) with five-second connect and read timeouts. It never blocks a refresh
+or sleep; a failed POST is recorded and the next cycle tries again. At one
+update per 15 minutes the point is around 1.2 kB (~90 kB/day), and the POST adds
+roughly 0.2–0.4 mAh/day inside a Wi-Fi window that is already open.
+
+Fields use snake_case with units in the name: scheduler/boot (`boot_count`,
+`wake`, `reset`, `checkup`, `usb`, `plan`, `target`, `missed_ms`,
+`completion_err_ms`, `awake_ms`), battery (`device_v`, `device_pct`), Wi-Fi
+(`wifi_ok`, `wifi_ms`, `wifi_cached`, `wifi_fallback`, `wifi_attempts`,
+`wifi_status`, `wifi_reason`, `rssi`, `channel`, `bssid`, `ip`), NTP (`ntp_ran`,
+`ntp_ok`, `ntp_attempts`, `ntp_ms`, `ntp_drift_ms`, `sync_age_s`, `clock_ok`),
+Fronius (`fr_*` including `fr_pv_w`, `fr_load_w`, `fr_grid_w`, `fr_batt_w`,
+`fr_soc`, `fr_backup`), Open-Meteo (`wx_*` including `wx_tmin_c`, `wx_tmax_c`,
+`wx_precip_pct`, `wx_code`), panel and light sleep (`prep_ms`, `refresh_ms`,
+`wait_sleeps`, `wait_slept_ms`, `ref_sleeps`, `ref_slept_ms`, `sleep_fails`),
+system (`chip_temp_c`, `heap_free`, `heap_min`, `heap_max`), and telemetry meta
+(`prev_post_ok`, `prev_post_ms`). Missing values are omitted instead of written
+as zero, so absent fields mean "not measured", not "zero". `src/metrics.cpp` is
+the authoritative list.
+
 ## Code and verification
 
 - `src/main.cpp`: wake → ADC → network → render → minute scheduling → sleep.
 - `src/network.cpp`: Wi-Fi, bounded HTTP requests, API parsing diagnostics.
+- `src/metrics.cpp`: RTC-held telemetry record and InfluxDB line protocol.
 - `src/battery.cpp` and `src/clock_sync.cpp`: LiPo ADC and NTP/RTC time.
 - `src/dashboard.cpp`: layout and text; `src/icons.cpp`: icons and flow arrows;
   `src/display.cpp`: panel driver.

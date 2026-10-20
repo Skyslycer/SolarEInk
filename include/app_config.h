@@ -6,6 +6,11 @@
 #include "config.example.h"
 #endif
 
+namespace App {
+// Reported as the Influx `fw` tag. Bump on every flashed change.
+constexpr char FIRMWARE_VERSION[] = "1.0.0";
+}
+
 namespace Hardware {
 constexpr int EPD_MOSI = 6;
 constexpr int EPD_SCK = 1;
@@ -35,6 +40,11 @@ constexpr uint32_t WIFI_RETRY_DELAY_MS = 500;
 constexpr uint32_t WIFI_CACHED_TIMEOUT_MS = 6000;
 constexpr unsigned API_ATTEMPTS = 10;
 constexpr uint32_t API_RETRY_DELAY_MS = 250;
+// Telemetry POST: one bounded attempt inside the Wi-Fi window the cycle already
+// has open. Timeouts match the API fetches so a slow first packet after Wi-Fi
+// power save still gets through; the next cycle tries again on failure.
+constexpr uint16_t INFLUX_CONNECT_TIMEOUT_MS = 5000;
+constexpr uint16_t INFLUX_READ_TIMEOUT_MS = 5000;
 constexpr uint32_t INITIAL_REFRESH_MS = 27000;
 constexpr uint32_t INITIAL_PREPARE_MS = 3000;
 constexpr uint32_t WAKE_MARGIN_MS = 1000;
